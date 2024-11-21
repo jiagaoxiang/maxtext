@@ -103,7 +103,7 @@ class BadSyntheticDataIterator:
     )
     dataset = tf.data.Dataset.zip((output))  # pytype: disable=wrong-arg-types
     dataset = dataset.repeat()
-    dataset = dataset.batch(config.global_batch_size_to_load // jax.process_count())
+    dataset = dataset.batch(config.eu.scale_batch_size(config.global_batch_size_to_load))
     return dataset
 
 
