@@ -36,6 +36,7 @@ def preprocessing_pipeline(
     tokenizer_path,
     hf_access_token,
     global_batch_size,
+    process_count,
     max_target_length,
     shuffle,
     data_shuffle_seed,
@@ -88,14 +89,14 @@ def preprocessing_pipeline(
   if packing:
     operations.append(
         grain.experimental.PackAndBatchOperation(
-            batch_size=global_batch_size // jax.process_count(),
+            batch_size=global_batch_size // process_count,
             length_struct={"inputs": max_target_length, "targets": max_target_length},
         )
     )
     operations.append(_input_pipeline_utils.ReformatPacking())
   else:
     operations.append(_input_pipeline_utils.PadToMaxLength(max_target_length))
-    operations.append(grain.Batch(batch_size=global_batch_size // jax.process_count(), drop_remainder=drop_remainder))
+    operations.append(grain.Batch(batch_size=global_batch_size // process_count, drop_remainder=drop_remainder))
 
   if shift:
     operations.append(_input_pipeline_utils.ShiftData(axis=1))
@@ -151,7 +152,8 @@ def make_hf_train_iterator(
       tokenize=config.tokenize_train_data,
       tokenizer_path=config.tokenizer_path,
       hf_access_token=config.hf_access_token,
-      global_batch_size=config.global_batch_size_to_load,
+      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load),
+      process_count=config.eu.good_process_count,
       max_target_length=config.max_target_length,
       shuffle=config.enable_data_shuffling,
       data_shuffle_seed=config.data_shuffle_seed,
@@ -189,7 +191,8 @@ def make_hf_eval_iterator(
       tokenize=config.tokenize_eval_data,
       tokenizer_path=config.tokenizer_path,
       hf_access_token=config.hf_access_token,
-      global_batch_size=config.global_batch_size_to_load_eval,
+      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load_eval),
+      process_count=config.eu.good_process_count,
       max_target_length=config.max_target_length,
       shuffle=False,
       data_shuffle_seed=config.data_shuffle_seed,

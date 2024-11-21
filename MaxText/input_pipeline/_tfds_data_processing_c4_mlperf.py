@@ -247,6 +247,7 @@ def preprocess_train_dataset(
     train_ds: tf.data.Dataset,
     sp_tokenizer,
     train_global_batch_size_to_load: int,
+    process_count: int,
     max_target_length: int,
     shuffle_buffer_size: int,
     data_shuffle_seed: int,
@@ -262,7 +263,7 @@ def preprocess_train_dataset(
   train_ds = sequence_packing.pack_dataset(train_ds, max_target_length)
 
   train_ds = train_ds.map(format_fn, num_parallel_calls=AUTOTUNE)
-  train_ds = train_ds.batch(train_global_batch_size_to_load // jax.process_count(), drop_remainder=True)
+  train_ds = train_ds.batch(train_global_batch_size_to_load // process_count, drop_remainder=True)
   train_ds = train_ds.prefetch(AUTOTUNE)
   return train_ds
 
@@ -270,6 +271,7 @@ def preprocess_train_dataset(
 def preprocess_eval_dataset(
     eval_ds: tf.data.Dataset,
     eval_global_batch_size_to_load: int,
+    process_count: int,
     max_target_length: int,
     num_examples: Optional[int] = None,
 ) -> tf.data.Dataset:
@@ -280,8 +282,8 @@ def preprocess_eval_dataset(
 
   # ensure array split in an equal division for each device
   # pad zeros up to the same batch_size among all processes
-  eval_ds = _pad_to_batch_size(eval_ds, eval_global_batch_size_to_load // jax.process_count(), num_examples)
-  eval_ds = eval_ds.batch(eval_global_batch_size_to_load // jax.process_count(), drop_remainder=False)
+  eval_ds = _pad_to_batch_size(eval_ds, eval_global_batch_size_to_load // process_count, num_examples)
+  eval_ds = eval_ds.batch(eval_global_batch_size_to_load // process_count, drop_remainder=False)
 
   # We are running eval over exactly one epoch.
   # We explicitly cache the entire epoch (in memory) to ensure that it is the
@@ -312,7 +314,8 @@ def make_c4_mlperf_train_iterator(
   train_ds = preprocess_train_dataset(
       train_ds,
       sp_tokenizer=sp_tokenizer,
-      train_global_batch_size_to_load=config.global_batch_size_to_load,
+      train_global_batch_size_to_load=config.eu.scale_by_good_slices(config.global_batch_size_to_load),
+      process_count=config.eu.good_process_count,
       max_target_length=config.max_target_length,
       shuffle_buffer_size=128,
       data_shuffle_seed=config.data_shuffle_seed,
@@ -340,7 +343,8 @@ def make_c4_mlperf_eval_iterator(
 
   eval_ds = preprocess_eval_dataset(
       eval_ds,
-      eval_global_batch_size_to_load=config.global_batch_size_to_load_eval,
+      eval_global_batch_size_to_load=config.eu.scale_by_good_slices(config.global_batch_size_to_load_eval),
+      process_count=config.eu.good_process_count,
       max_target_length=config.max_target_length,
   )
 
