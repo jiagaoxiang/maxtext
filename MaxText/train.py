@@ -83,7 +83,7 @@ def validate_train_config(config):
   if not config.base_output_directory.startswith("gs://"):
     max_logging.log("WARNING: 'base_output_directory' might be pointing your local file system")
   assert config.steps > 0, "You must set steps or learning_rate_schedule_steps to a positive integer."
-  if hasattr(config, 'tolerance'):
+  if hasattr(config, "tolerance"):
     if config.tolerance > 1.0 or config.tolerance < 0.0:
       max_logging.log("WARNING: 'tolerance: allowed percentage of non-sharded parameters' should be between 0.0 and 1.0")
   else:
