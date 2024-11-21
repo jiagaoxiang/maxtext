@@ -22,6 +22,7 @@ import os
 import sys
 from typing import Any, Union
 
+import elasticutils
 import jax
 from jax.experimental.compilation_cache import compilation_cache
 from layers.attentions import AttentionType
@@ -429,6 +430,7 @@ class _HyperParameters:
       raw_keys["add_eos"] = False
       max_logging.log("Override add_bos and add_eos to False when dataset_type=c4_mlperf")
 
+    raw_keys["eu"] = elasticutils.ElasticUtils(jax.devices(), raw_keys["num_slices"], 3, 5)
     # Write raw_keys to GCS before type conversions
     max_utils.write_config_raw_keys_for_gcs(raw_keys)
 
