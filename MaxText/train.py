@@ -25,11 +25,13 @@ import os
 import sys
 import functools
 import time
+import random as py_random
 
 from typing import Sequence, Optional
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+import gkeutils
 import grain.python as grain
 import jax
 import numpy as np
@@ -559,182 +561,254 @@ def setup_train_loop(config):
   )
 
 
-def train_loop(config, state=None):
-  """Main Training loop.
-  Args:
-    config:
-    state:
-    ckpt_path:
-  Returns:
-  """
+def reshard_fn(config: pyconfig.HyperParameters):
+  """Reshard function."""
+  # Mesh definition
+  devices_array = max_utils.create_device_mesh(config)
+  mesh = Mesh(devices_array, config.mesh_axes)
+  data_iterator, _ = create_data_iterator(config, mesh)
+
+  shardings = jax.tree.map(
+      lambda x: jax.sharding.NamedSharding(mesh, x.sharding.spec),
+      config.eu.data["state"],
+  )
+  state = config.eu.reshard(config.eu.data["state"], shardings)
+  step = config.eu.data["step"]
+
+  return step, state, mesh, data_iterator
+
+
+def train_loop(config):
+  """Main Training loop."""
+  last_killed_step = 0
+  kill_slice_period = 14
+
+  # Change global_batch_size_to_load, global_batch_size_to_train_on
+  # Record to GCS about changes in number of slices (later)
+
   # Create a GoodputRecorder to log information
   recorder = create_goodput_recorder(config)
-  record_goodput(recorder, config, recorder.record_job_start_time if recorder else None)
+  record_goodput(
+      recorder, config, recorder.record_job_start_time if recorder else None
+  )
 
   (
       init_rng,
       writer,
       checkpoint_manager,
-      state_mesh_annotations,
+      _,
       model,
       mesh,
       learning_rate_schedule,
       data_iterator,
-      eval_data_iterator,
+      _,
       state,
   ) = setup_train_loop(config)
-  # pylint: disable=line-too-long
   (
       functional_train,
-      in_shard_train,
-      out_shard_train,
+      _,
+      _,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(
+      train_step, mesh, model, config
+  )
 
-  if eval_data_iterator:
-    # pylint: disable=line-too-long
-    (
-        functional_eval,
-        in_shard_eval,
-        out_shard_eval,
-        static_argnums_eval,
-        donate_argnums_eval,
-    ) = maxtext_utils.get_functional_eval_with_signature(eval_step, mesh, state_mesh_annotations, model, config)
-
-  num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
+  num_model_parameters = max_utils.calculate_num_params_from_pytree(
+      state.params
+  )
   max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
-  per_device_tflops, _, _ = maxtext_utils.calculate_tflops_training_per_device(config)
+  per_device_tflops, _, _ = maxtext_utils.calculate_tflops_training_per_device(
+      config
+  )
   per_device_tokens = maxtext_utils.calculate_tokens_training_per_device(config)
 
   # Write train config params, num model params, and XLA flags to tensorboard
-  max_utils.add_text_to_summary_writer("num_model_parameters", str(num_model_parameters), writer)
-  max_utils.add_text_to_summary_writer("libtpu_init_args", os.environ["LIBTPU_INIT_ARGS"], writer)
+  max_utils.add_text_to_summary_writer(
+      "num_model_parameters", str(num_model_parameters), writer
+  )
+  max_utils.add_text_to_summary_writer(
+      "libtpu_init_args", os.environ["LIBTPU_INIT_ARGS"], writer
+  )
   max_utils.add_config_to_summary_writer(config, writer)
 
-  # Define the compilation of functional_train, either by loading the compiled version or wrapping a new one in a jit
+  # Define the compilation of functional_train, either by loading the compiled
+  # version or wrapping a new one in a jit
   if config.compiled_trainstep_file != "":
     print("Loading the compiled function...", flush=True)
-    # Need to pass train signature and state to determine i/o shapes of train_state for now.
+    # Need to pass train signature and state to determine i/o shapes of
+    # train_state for now.
     p_train_step = maxtext_utils.load_compiled(config, functional_train, state)
     # TODO: p_eval_step is not yet supported in load_compiled
-    p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
     p_train_step = jax.jit(
         functional_train,
-        in_shardings=in_shard_train,
-        out_shardings=out_shard_train,
         static_argnums=static_argnums_train,
         donate_argnums=donate_argnums_train,
     )
 
-    if eval_data_iterator:
-      p_eval_step = jax.jit(
-          functional_eval,
-          in_shardings=in_shard_eval,
-          out_shardings=out_shard_eval,
-          static_argnums=static_argnums_eval,
-          donate_argnums=donate_argnums_eval,
-      )
-    else:
-      p_eval_step = None
-
-  local_metrics_file = open(config.metrics_file, "a", encoding="utf8") if config.metrics_file else None
+  local_metrics_file = (
+      open(config.metrics_file, "a", encoding="utf8")
+      if config.metrics_file
+      else None
+  )
   running_gcs_metrics = [] if config.gcs_metrics else None
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  # this is the start_step for training
+  start_step = get_first_step(state)
   first_profiling_step = start_step + config.skip_first_n_steps_for_profiler
-  if config.profiler != "" and first_profiling_step >= config.steps:
-    raise ValueError("Profiling requested but initial profiling step set past training final step")
-  last_profiling_step = np.clip(first_profiling_step + config.profiler_steps - 1, first_profiling_step, config.steps - 1)
+  if config.profiler and first_profiling_step >= config.steps:
+    raise ValueError(
+        "Profiling requested but initial profiling step set past training "
+        "final step"
+    )
+  last_profiling_step = np.clip(
+      first_profiling_step + config.profiler_steps - 1,
+      first_profiling_step,
+      config.steps - 1,
+  )
 
   example_batch = None
   last_step_completion = datetime.datetime.now()
   prof = profiler.Profiler(config)
-  for step in np.arange(start_step, config.steps):
-    if step == first_profiling_step:
-      if config.profile_cleanly:
-        jax.block_until_ready(state)  # Block until previous state finishes to start profile cleanly
-      prof.activate()
+  step = start_step
 
-    with jax.profiler.StepTraceAnnotation("train", step_num=step):
-      record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
-      example_batch = load_next_batch(data_iterator, example_batch, config)
-      record_goodput(recorder, config, recorder.record_data_loading_end_time if recorder else None)
-      check_example_batch(config, example_batch=example_batch)
-      # pylint: disable=not-callable
-      nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-      record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
-      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        state, metrics = p_train_step(state, example_batch, nextrng)
 
-    new_time = datetime.datetime.now()
-    record_scalar_metrics(
-        metrics, new_time - last_step_completion, per_device_tflops, learning_rate_schedule(step), per_device_tokens
-    )
-    last_step_completion = new_time
+  while (
+      step < config.steps
+      and config.eu.elastic_failure_count < config.elastic_max_failures
+  ):
+    try:
+      if step == first_profiling_step and config.profile_cleanly:
+        # Block until previous state finishes to start profile cleanly
+        jax.block_until_ready(state)
+        prof.activate()
 
-    if checkpoint_manager is not None:
-      if save_checkpoint(checkpoint_manager, int(step), state, config.dataset_type, data_iterator, config):
-        max_logging.log(f"saved a checkpoint at step {step}")
-
-      # Upon preemption, exit when and only when all ongoing saves are complete.
-      if checkpoint_manager.reached_preemption(step):
-        checkpoint_manager.wait_until_finished()
-        sys.exit()
-
-    write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
-
-    if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
-      assert eval_data_iterator
-      cumulative_eval_metrics = {
-          "scalar": {
-              "eval/total_loss": 0.0,
-              "eval/total_weights": 0.0,
-              "eval/avg_loss": 0.0,
-              "eval/moe_lb_loss": 0.0,
-          }
-      }
-      eval_step_count = 0
-      # pylint: disable=not-callable
-      for eval_batch in eval_data_iterator:
-        if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
-          break
+      with jax.profiler.StepTraceAnnotation("train", step_num=step):
+        record_goodput(
+            recorder,
+            config,
+            recorder.record_data_loading_start_time if recorder else None,
+        )
+        example_batch = load_next_batch(data_iterator, example_batch, config)
+        record_goodput(
+            recorder,
+            config,
+            recorder.record_data_loading_end_time if recorder else None,
+        )
+        check_example_batch(config, example_batch=example_batch)
+        # pylint: disable=not-callable
+        nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
+        record_goodput(
+            recorder,
+            config,
+            recorder.record_step_start_time if recorder else None,
+            step,
+        )
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-          eval_metrics = p_eval_step(state, eval_batch, nextrng)
-        cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(eval_metrics["scalar"]["evaluation/total_loss"])
-        cumulative_eval_metrics["scalar"]["eval/total_weights"] += float(eval_metrics["scalar"]["evaluation/total_weights"])
-        cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] += float(eval_metrics["scalar"]["evaluation/moe_lb_loss"])
-        max_logging.log(f"Completed eval step {eval_step_count}")
-        eval_step_count += 1
-      eval_loss = (
-          cumulative_eval_metrics["scalar"]["eval/total_loss"]
-          / (cumulative_eval_metrics["scalar"]["eval/total_weights"] + EPS)
-          + cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] / eval_step_count
-      )
-      cumulative_eval_metrics["scalar"]["eval/avg_loss"] = eval_loss
-      write_metrics(
-          writer, local_metrics_file, running_gcs_metrics, cumulative_eval_metrics, step, config, is_training=False
-      )
-      max_logging.log(
-          f"average loss after {step=}: {eval_step_count=}, {eval_loss=}, total_weights={cumulative_eval_metrics['scalar']['eval/total_weights']}"
-      )
-      if eval_loss <= config.target_eval_loss:
-        max_logging.log(f"Early stop and exit loop after reaching {config.target_eval_loss=}")
-        prof.deactivate()
-        break
+          state, metrics = p_train_step(state, example_batch, nextrng)
 
-    if step == last_profiling_step:
-      if config.profile_cleanly:
-        jax.block_until_ready(state)  # Block until current state finishes to end profile cleanly
-      prof.deactivate()
+        if step % config.eu.save_period == 0:
+          config.eu.save({"step": step, "state": state})
+
+        if (
+            step > last_killed_step
+            and step % config.elastic_step_kill_period == 0
+        ):
+          kill_slice_index = py_random.randrange(0, config.eu.total_num_slices)
+          max_logging.log(
+              f'{kill_slice_index=}, {step=}, {last_killed_step=}'
+          )
+          last_killed_step = max(last_killed_step, step)
+          gkeutils.kill_slice(kill_slice_index)
+
+      new_time = datetime.datetime.now()
+      record_scalar_metrics(
+          metrics,
+          new_time - last_step_completion,
+          per_device_tflops,
+          learning_rate_schedule(step),
+          per_device_tokens,
+      )
+      last_step_completion = new_time
+
+      if checkpoint_manager is not None:
+        if save_checkpoint(
+            checkpoint_manager,
+            int(step),
+            state,
+            config.dataset_type,
+            data_iterator,
+            config,
+        ):
+          max_logging.log(f"saved a checkpoint at step {step}")
+
+        # Upon preemption, exit when and only when all ongoing saves are
+        # complete.
+        if checkpoint_manager.reached_preemption(step):
+          checkpoint_manager.wait_until_finished()
+          sys.exit()
+
+      write_metrics(
+          writer,
+          local_metrics_file,
+          running_gcs_metrics,
+          metrics,
+          step,
+          config,
+      )
+
+      if step == last_profiling_step:
+        if config.profile_cleanly:
+          # Block until current state finishes to end profile cleanly
+          jax.block_until_ready(state)
+        prof.deactivate()
+
+      reshard_flag = config.eu.is_ready_to_reshard(step)
+      if reshard_flag or step % eu.save_period == 0:
+        config.eu.save({"step": step + 1, "state": state})
+
+      if step > last_killed_step and step % kill_slice_period == 0:
+        kill_slice_index = py_random.randint(0, config.eu.total_slice_count)
+        max_logging.log(f"{kill_slice_index=}, {step=}, {last_killed_step=}")
+        last_killed_step = max(last_killed_step, step)
+        gkeutils.try_kill_slice(kill_slice_index)
+
+      step += 1
+
+    except jax.errors.JaxRuntimeError as e:
+      if "INTERNAL: Pipe from scheduler to aggregator" in str(e):
+        max_logging.log("Caught JaxRuntimeError INTERNAL exception")
+
+      elif "DATA_LOSS" in str(e):
+        max_logging.log("Caught JaxRuntimeError DATA_LOSS exception")
+
+      else:
+        max_logging.log("Unknown JaxRuntimeError")
+        raise
+
+      config.eu.slice_down()
+      reshard_flag = True
+
+    if reshard_flag:
+      step, state, mesh, data_iterator = reshard_fn(config)
+      max_logging.log("Resharding complete. Retrying.")
 
   if checkpoint_manager is not None:
     checkpoint_manager.wait_until_finished()
-  write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config)  # final step metrics
+  write_metrics(
+      writer,
+      local_metrics_file,
+      running_gcs_metrics,
+      metrics,  # pylint: disable=undefined-variable
+      config.steps - 1,
+      config,
+  )  # final step metrics
   max_utils.close_summary_writer(writer)
-  record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
+  record_goodput(
+      recorder, config, recorder.record_job_end_time if recorder else None
+  )
   clear_buffered_metrics()
   return state
 

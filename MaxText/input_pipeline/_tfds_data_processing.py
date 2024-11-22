@@ -70,7 +70,6 @@ def preprocessing_pipeline(
     dataset,
     tokenizer_path,
     global_batch_size: int,
-    process_count: int,
     global_mesh,
     max_target_length: int,
     data_column_name,
@@ -117,11 +116,11 @@ def preprocessing_pipeline(
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible number of global devices."
   if pack_examples:
     dataset = sequence_packing.pack_dataset(dataset, max_target_length)
-    dataset = dataset.batch(global_batch_size // process_count, drop_remainder=drop_remainder)
+    dataset = dataset.batch(global_batch_size // jax.process_count(), drop_remainder=drop_remainder)
   else:
     # simple (static-shape) padded batching
     dataset = dataset.padded_batch(
-        global_batch_size // process_count,
+        global_batch_size // jax.process_count(),
         padded_shapes={"inputs": max_target_length, "targets": max_target_length},
         padding_values={"inputs": 0, "targets": 0},
         drop_remainder=drop_remainder,
@@ -153,8 +152,7 @@ def make_tfds_train_iterator(
   train_iter = preprocessing_pipeline(
       dataset=train_ds,
       tokenizer_path=config.tokenizer_path,
-      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load),
-      process_count=config.eu.good_process_count,
+      global_batch_size=config.global_batch_size_to_load,
       global_mesh=global_mesh,
       max_target_length=config.max_target_length,
       data_column_name=config.train_data_column,
@@ -184,8 +182,7 @@ def make_tfds_eval_iterator(
   eval_iter = preprocessing_pipeline(
       dataset=eval_ds,
       tokenizer_path=config.tokenizer_path,
-      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load_eval),
-      process_count=config.eu.good_process_count,
+      global_batch_size=config.global_batch_size_to_load_eval,
       global_mesh=global_mesh,
       max_target_length=config.max_target_length,
       data_column_name=config.eval_data_column,

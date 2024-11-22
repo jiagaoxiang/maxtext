@@ -415,10 +415,10 @@ def create_custom_64x4_device_mesh(
 def create_device_mesh(config, devices=None):
   """Creates a device mesh with each slice in its own data parallel group. If there is only one slice, uses two replicas"""
   if devices is None:
-    devices = jax.devices()
+    devices = config.eu.devices
   num_devices = len(devices)
-  num_slices = config.num_slices
-  num_devices_per_slice = num_devices // num_slices
+  num_slices = config.eu.slice_count
+  num_devices_per_slice = config.eu.slice_device_count
 
   multi_slice_env = num_slices > 1
 

@@ -634,6 +634,14 @@ class HyperParameters:  # pylint: disable=missing-class-docstring
   def __init__(self):
     pass
 
+  @property
+  def global_batch_size_to_train_on(self):
+    return self.eu.scale_batch_size(_config.keys["global_batch_size_to_train_on"])
+
+  @property
+  def global_batch_size_to_load(self):
+    return self.eu.scale_batch_size(_config.keys["global_batch_size_to_load"])
+
   def __getattr__(self, attr):
     if attr not in _config.keys:
       raise ValueError(f"Requested key {attr}, not in config")

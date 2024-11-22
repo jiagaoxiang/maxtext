@@ -39,7 +39,6 @@ def preprocessing_pipeline(
     dataset,
     tokenizer_path,
     global_batch_size: int,
-    process_count: int,
     global_mesh,
     max_target_length: int,
     grain_worker_count: int,
@@ -72,14 +71,14 @@ def preprocessing_pipeline(
   if packing:
     operations.append(
         grain.experimental.PackAndBatchOperation(
-            batch_size=global_batch_size // process_count,
+            batch_size=global_batch_size // jax.process_count(),
             length_struct={"inputs": max_target_length, "targets": max_target_length},
         )
     )
     operations.append(_input_pipeline_utils.ReformatPacking())
   else:
     operations.append(_input_pipeline_utils.PadToMaxLength(max_target_length))
-    operations.append(grain.Batch(batch_size=global_batch_size // process_count, drop_remainder=drop_remainder))
+    operations.append(grain.Batch(batch_size=global_batch_size // jax.process_count(), drop_remainder=drop_remainder))
 
   # Shift inputs for teacher-forced training
   if shift:
@@ -118,8 +117,7 @@ def make_grain_train_iterator(
   train_iter = preprocessing_pipeline(
       dataset=train_ds,
       tokenizer_path=config.tokenizer_path,
-      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load),
-      process_count=config.eu.good_process_count,
+      global_batch_size=config.global_batch_size_to_load,
       global_mesh=global_mesh,
       max_target_length=config.max_target_length,
       grain_worker_count=config.grain_worker_count,
@@ -145,8 +143,7 @@ def make_grain_eval_iterator(
   eval_iter = preprocessing_pipeline(
       dataset=eval_ds,
       tokenizer_path=config.tokenizer_path,
-      global_batch_size=config.eu.scale_by_good_slices(config.global_batch_size_to_load),
-      process_count=config.eu.good_process_count,
+      global_batch_size=config.global_batch_size_to_load_eval,
       global_mesh=global_mesh,
       max_target_length=config.max_target_length,
       grain_worker_count=config.grain_worker_count,
