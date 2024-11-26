@@ -17,9 +17,11 @@ logger = logging.getLogger(__name__)
 @contextlib.contextmanager
 def timer(name: str):
   start = time.time()
-  yield
-  end = time.time()
-  logger.info("%s elaspsed %.2fs.", name, end - start)
+  try:
+    yield
+  finally:
+    end = time.time()
+    logger.info("%s elaspsed %.2fs.", name, end - start)
 
 
 class ElasticUtils:
@@ -33,6 +35,7 @@ class ElasticUtils:
       total_slice_count: int,
       save_period: Optional[int] = None,
       reshard_check_period: Optional[int] = None,
+      max_failures: Optional[int] = None,
   ):
     self.devices = devices
     self.total_slice_count = total_slice_count
@@ -45,6 +48,10 @@ class ElasticUtils:
       reshard_check_period = 1
     self.reshard_check_period = reshard_check_period
 
+    if max_failures is None:
+      max_failures = float("inf")
+    self.max_failures = max_failures
+
     self.failure_count = 0
     self.good_slice_indices = self.get_slice_availability()
     self.good_data_slice_indices = set()
@@ -53,6 +60,7 @@ class ElasticUtils:
 
   def slice_down(self):
     """Slice down."""
+    logger.info("Slice down")
     self.good_slice_indices = self.get_slice_availability()
     self.failure_count += 1
 
@@ -117,16 +125,6 @@ class ElasticUtils:
     )
 
   @property
-  def good_process_indices(self) -> set[int]:
-    """Returns the good process indices."""
-    return {d.process_index for d in self.good_devices}
-
-  @property
-  def good_process_count(self) -> int:
-    """Returns the number of good processes."""
-    return len(self.good_process_indices)
-
-  @property
   def good_slice_count(self) -> int:
     """Returns the number of slices."""
     return len(self.good_slice_indices)
@@ -155,20 +153,27 @@ class ElasticUtils:
     }
 
     for slice_index, x in results.items():
+      logger.info(f"checking {slice_index=}")  # pylint: disable=logging-fstring-interpolation
       expected = (
           np.zeros(self.slice_device_count(slice_index), dtype=float)
           + self.TEST_VALUE
       )
       try:
-        if np.allclose(x, expected):
-          good_slice_indices.add(slice_index)
-        else:
-          logger.error("Error with _simple_execution. This should not happen.")
+        with timer(f"checking {slice_index=}"):
+          if np.allclose(x, expected):
+            good_slice_indices.add(slice_index)
+          else:
+            logger.error(  # pylint: disable=logging-fstring-interpolation
+                f"Error with _simple_execution for {slice_index=}. "
+                "This should not happen."
+            )
       except jax.errors.JaxRuntimeError as e:
         if "DATA_LOSS" in str(e):
-          logger.info("Caught JaxRuntimeError DATA_LOSS exception")
+          logger.info(  # pylint: disable=logging-fstring-interpolation
+              f"Caught JaxRuntimeError DATA_LOSS exception for {slice_index=}"
+          )
         else:
-          logger.exception("Unknown JaxRuntimeError")
+          logger.exception(f"Unknown JaxRuntimeError for {slice_index=}")  # pylint: disable=logging-fstring-interpolation
 
     return good_slice_indices
 
@@ -216,14 +221,16 @@ class ElasticUtils:
 
   def scale_by_good_slices(self, x: int | float) -> int | float:
     """Scale x by the number of good slices."""
-    return x * self.good_slice_count / self.total_slice_count
+    if isinstance(x, int):
+      ret, remainder = divmod(x * self.good_slice_count, self.total_slice_count)
+      if remainder:
+        raise ValueError(
+            f"Cannot scale {x=} by good slices because it will result in a "
+            f"remainder of {remainder=}."
+        )
+      return ret
+    elif isinstance(x, float):
+      return x * self.good_slice_count / self.total_slice_count
+    else:
+      raise ValueError(f"Unsupported type: {type(x)}")
 
-  def scale_batch_size(self, global_batch_size: int) -> int:
-    """Scale the batch size."""
-    if global_batch_size % self.good_process_count:
-      raise ValueError(
-          "Batch size must be divisible by the number of good processes"
-      )
-    return (
-        self.scale_by_good_slices(global_batch_size) // self.good_process_count
-    )
