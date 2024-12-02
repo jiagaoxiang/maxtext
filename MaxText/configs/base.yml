@@ -78,7 +78,9 @@ quantization: ""
 # https://kolonist26-jax-kr.readthedocs.io/en/latest/jax.lax.html#jax.lax.Precision
 matmul_precision: "default"
 activations_in_float32: False # Sets activations to float32 before nonlinearity it true, else dtype
-# Path to file with quantization config for intmp. 
+# Used to replicate the quantization scale to avoid the inefficient XLA fusion for 2d sharding.
+replicate_quant_scale: False
+# Path to file with quantization config for intmp.
 quant_cfg_path: ""
 quantize_kvcache: False # Set to True to quantize KV Cache values, defaults to False
 # Valid kv_quant_axis values:
@@ -206,6 +208,12 @@ local_checkpoint_directory: ""
 # It should be a positive number when and only when `enable_emergency_checkpoint` is True.
 local_checkpoint_period: 0
 
+# Whether or not to use emergency checkpoint with the replicator service.
+use_replicator_service: False
+
+# The interval to backup local checkpoints to the persistent storage.
+replicator_backup_interval_minutes: 0
+
 # Jax cache directory
 jax_cache_dir: "~/jax_cache"
 
@@ -227,6 +235,7 @@ logical_axis_rules: [
                       ['activation_embed', 'tensor'],
                       ['activation_mlp', 'tensor'],
                       ['activation_kv', 'tensor'],
+                      ['activation_prefill_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_kv_head_dim', 'tensor'],
                       ['activation_vocab', ['tensor', 'sequence']],
@@ -241,11 +250,13 @@ logical_axis_rules: [
                       ['embed_no_exp', ['fsdp', 'fsdp_transpose', 'sequence']],
                       ['embed_no_exp', ['fsdp', 'sequence']],
                       ['norm', 'tensor'],
+                      ['q_heads', ['tensor', 'autoregressive']],
                       ['heads', ['tensor', 'autoregressive']],
                       ['layers', 'stage'],
                       ['kv', []],
                       ['kv_heads', ['tensor', 'autoregressive']],
                       ['kv_head_dim', []],
+                      ['cache_batch_prefill', []],
                       ['cache_batch', []],
                       ['cache_heads', ['autoregressive', 'tensor']],
                       ['cache_kv', []],
@@ -430,6 +441,9 @@ inference_microbenchmark_log_file_path: ""
 inference_metadata_file: "" # path to a json file
 enable_model_warmup: False
 
+# Stack prefill cache across the layer to reduce the
+# Python layer latency.
+stack_prefill_result_cache: False
 
 # KV Cache layout control
 # Logical layout: 0,1,2,3 ; CACHE_BATCH, CACHE_SEQUENCE, CACHE_HEADS, CACHE_KV
@@ -457,7 +471,7 @@ enable_checkpoint_cloud_logger: False
 # Single-controller
 enable_single_controller: False
 
-custom_mesh: "" # Available options: ['hybrid_ring_64x4']
+custom_mesh: "" # Available options: ['hybrid_ring_64x4', 'hybrid_ring_32x8']
 # Split physical axes for https://jax.readthedocs.io/en/latest/_autosummary/jax.experimental.mesh_utils.create_device_mesh.html
 allow_split_physical_axes: False
 
