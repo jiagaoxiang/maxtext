@@ -563,7 +563,6 @@ class VisionTransformer(nn.Module):
     self.intermediate_layers_indices = self.config.intermediate_layers_indices #[3, 7, 15, 23, 30]
 
     self.num_patches = (self.image_size // self.patch_size) ** 2 + 1 #1025
-    self.scale = self.config.hidden_size**-0.5
   
     self.patch_embedding = nn.Conv(
         self.hidden_size,
@@ -572,20 +571,31 @@ class VisionTransformer(nn.Module):
         padding="VALID",
         use_bias=False,
         dtype=self.config.dtype,
+        param_dtype=self.config.weight_dtype,
         kernel_init=jax.nn.initializers.normal(),
     )
 
-    self.class_embedding = self.param("class_embedding", jax.nn.initializers.normal(stddev=0.02), (self.config.hidden_size,))
-    self.gated_positional_embedding = FlaxMllamaPrecomputedPositionEmbedding(self.config, dtype=self.dtype,)
+    self.class_embedding = self.param("class_embedding", jax.nn.initializers.normal(stddev=0.02), (self.config.hidden_size,), self.config.weight_dtype)
+    self.gated_positional_embedding = VisionPrecomputedPositionEmbedding(self.config)
 
-    self.pre_tile_positional_embedding = FlaxMllamaPrecomputedAspectRatioEmbedding(self.config, is_gated=True, dtype=self.dtype,)
-    self.post_tile_positional_embedding = FlaxMllamaPrecomputedAspectRatioEmbedding(self.config, is_gated=True, dtype=self.dtype,)
+    self.pre_tile_positional_embedding = VisionPrecomputedAspectRatioEmbedding(self.config, is_gated=True)
+    self.post_tile_positional_embedding = VisionPrecomputedAspectRatioEmbedding(self.config, is_gated=True)
 
-    self.layernorm_pre = nn.LayerNorm(epsilon=self.config.norm_eps, dtype=self.dtype,)
-    self.layernorm_post = nn.LayerNorm(epsilon=self.config.norm_eps, dtype=self.dtype,)
-    
-    self.transformer = FlaxMllamaVisionEncoder(self.config, self.config.num_hidden_layers, dtype=self.dtype,)
-    self.global_transformer = FlaxMllamaVisionEncoder(self.config, self.config.num_global_layers, dtype=self.dtype, is_gated=True)
+    self.layernorm_pre = LayerNorm(
+      epsilon=self.config.normalization_layer_epsilon, 
+      dtype=self.config.dtype,
+      weight_dtype=self.config.weight_dtype,
+      kernel_axes=("norm",),
+      )
+    self.layernorm_post = LayerNorm(
+      epsilon=self.config.normalization_layer_epsilon, 
+      dtype=self.config.dtype,
+      weight_dtype=self.config.weight_dtype,
+      kernel_axes=("norm",),
+      )
+
+    self.transformer = VisionEncoder(self.config, self.config.num_hidden_layers, is_gated=False) #32 layers
+    self.global_transformer = VisionEncoder(self.config, self.config.num_global_layers, is_gated=True) #8 layers
 
   def get_input_embeddings(self):
       """
@@ -605,15 +615,10 @@ class VisionTransformer(nn.Module):
       pixel_values: jnp.ndarray,
       aspect_ratio_ids: jnp.ndarray,
       aspect_ratio_mask: jnp.ndarray,
-      output_attentions: bool = False,
-      output_hidden_states: bool = False,
-      return_dict: bool = True,
   ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         batch_size, num_concurrent_media, num_tiles, num_channels, height, width = pixel_values.shape
 
@@ -658,26 +663,23 @@ class VisionTransformer(nn.Module):
 
         # Apply encoder
         hidden_state = hidden_state.reshape((batch_size * num_concurrent_media, -1, dim))
-        output = self.transformer(
+        hidden_state, all_intermediate_hidden_states = self.transformer(
             hidden_state,
             attention_mask=attention_mask,
             output_hidden_states=True,
-            output_attentions=output_attentions,
         )
-        hidden_state = output[0]
         hidden_state = self.layernorm_post(hidden_state)
 
         # Apply global encoder
         hidden_state = hidden_state.reshape((batch_size * num_concurrent_media, num_tiles, num_patches + num_padding_patches, dim))
         hidden_state = self.post_tile_positional_embedding(hidden_state, aspect_ratio_ids)
         hidden_state = hidden_state.reshape((batch_size * num_concurrent_media, num_tiles * (num_patches + num_padding_patches), dim))
-        global_output = self.global_transformer(
+        hidden_state = self.global_transformer(
             hidden_state,
             attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
-        )
-        hidden_state = global_output[0]
+            output_attentions=False,
+        )[0]
 
         # Remove padding from hidden state
         hidden_state = hidden_state.reshape((batch_size * num_concurrent_media, num_tiles, num_patches + num_padding_patches, dim))
@@ -685,7 +687,6 @@ class VisionTransformer(nn.Module):
         hidden_state = hidden_state.reshape((batch_size, num_concurrent_media, num_tiles, num_patches, dim))
 
         # Collect intermediate layer outputs from encoder output
-        all_intermediate_hidden_states = output[1]
         intermediate_hidden_states = jnp.stack(all_intermediate_hidden_states, axis=-1)
         intermediate_hidden_states = intermediate_hidden_states[..., self.intermediate_layers_indices]
 
@@ -697,22 +698,4 @@ class VisionTransformer(nn.Module):
         # Concatenate final hidden state and intermediate hidden states
         hidden_state = jnp.concatenate([hidden_state, intermediate_hidden_states], axis=-1)
 
-        if output_hidden_states:
-            hidden_states = tuple(all_intermediate_hidden_states) + tuple(global_output[1])
-        else:
-            hidden_states = None
-
-        if output_attentions:
-            global_attn = tuple(global_output[2]) if output_hidden_states else tuple(global_output[1])
-            attentions = tuple(output[2]) + global_attn
-        else:
-            attentions = None
-
-        if not return_dict:
-            return tuple(v for v in [hidden_state, hidden_states, attentions] if v is not None)
-
-        return FlaxBaseModelOutput(
-            last_hidden_state=hidden_state,
-            hidden_states=hidden_states,
-            attentions=attentions,
-        )
+        return hidden_state
