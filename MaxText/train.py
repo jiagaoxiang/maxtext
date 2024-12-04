@@ -71,7 +71,7 @@ from ml_goodput_measurement import monitoring
 Transformer = models.Transformer
 EPS = 1e-8
 _DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE = 2 * 1024**3
-_DEFAULT_TOLERANCE = 0.02
+_DEFAULT_SHARDING_TOLERANCE = 0.02
 
 
 def validate_train_config(config):
@@ -83,7 +83,7 @@ def validate_train_config(config):
   if not config.base_output_directory.startswith("gs://"):
     max_logging.log("WARNING: 'base_output_directory' might be pointing your local file system")
   assert config.steps > 0, "You must set steps or learning_rate_schedule_steps to a positive integer."
-  if "tolerance" in config.__dict__ and (config.tolerance > 1.0 or config.tolerance < 0.0):
+  if "sharding_tolerance" in config.__dict__ and (config.sharding_tolerance > 1.0 or config.sharding_tolerance < 0.0):
     max_logging.log("WARNING: 'tolerance: allowed percentage of non-sharded parameters' should be between 0.0 and 1.0")
   if config.quantization == "fp8":
     # pylint: disable=line-too-long
@@ -553,7 +553,7 @@ def setup_train_loop(config):
   record_goodput(recorder, config, recorder.record_tpu_init_end_time if recorder else None)
   record_goodput(recorder, config, recorder.record_training_preparation_start_time if recorder else None)
   data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
-  tolerance = config.tolerance if "tolerance" in config.__dict__ else _DEFAULT_TOLERANCE
+  sharding_tolerance = config.sharding_tolerance if "sharding_tolerance" in config.__dict__ else _DEFAULT_SHARDING_TOLERANCE
 
   state, _, state_mesh_shardings, data_iterator = max_utils.setup_training_state(
       model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
@@ -561,7 +561,7 @@ def setup_train_loop(config):
 
   if not config.using_pipeline_parallelism:
     # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
-    maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, tolerance)
+    maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, sharding_tolerance)
   record_goodput(recorder, config, recorder.record_training_preparation_end_time if recorder else None)
   return (
       init_rng,
